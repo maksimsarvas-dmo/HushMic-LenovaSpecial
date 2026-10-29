@@ -34,6 +34,8 @@ mod mode;
 mod model;
 #[cfg(feature = "native")]
 mod native;
+#[cfg(feature = "npu")]
+mod openvino;
 mod runtime;
 mod stft;
 mod stream;
@@ -43,6 +45,8 @@ pub use error::Error;
 pub use mode::{GainRamp, Mode, MUTE_RAMP_SAMPLES};
 #[cfg(feature = "native")]
 pub use native::{Engine, Inference};
+#[cfg(feature = "npu")]
+pub use openvino::{NpuEngine, NpuInference};
 #[cfg(feature = "load-dynamic")]
 pub use runtime::{init_runtime, RuntimeInit};
 pub use stream::StreamDenoiser;

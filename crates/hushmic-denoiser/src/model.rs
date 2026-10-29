@@ -19,11 +19,13 @@ pub struct Model {
     pub init_state: Vec<f32>,
 }
 
-/// What runs the graph. Without the `native` feature this is always ONNX.
+/// What runs the graph. Without the `native` or `npu` features this is always ONNX.
 enum Engine {
     Onnx(Session),
     #[cfg(feature = "native")]
     Native(crate::native::NativeModel),
+    #[cfg(feature = "npu")]
+    Npu(crate::openvino::OpenVinoModel),
 }
 
 fn parse_csv_f32(s: &str) -> Vec<f32> {
@@ -158,6 +160,8 @@ impl Model {
         match &self.engine {
             Engine::Onnx(_) => None,
             Engine::Native(n) => Some(n.kernels),
+            #[cfg(feature = "npu")]
+            Engine::Npu(_) => None,
         }
     }
 
@@ -166,6 +170,25 @@ impl Model {
         match &self.engine {
             Engine::Onnx(_) => crate::native::Engine::Onnx,
             Engine::Native(n) => n.engine,
+            #[cfg(feature = "npu")]
+            Engine::Npu(_) => crate::native::Engine::Onnx,
+        }
+    }
+
+    #[cfg(feature = "npu")]
+    pub fn npu(model: crate::openvino::OpenVinoModel, init_state: Vec<f32>) -> Model {
+        Model {
+            state_size: model.state_size(),
+            engine: Engine::Npu(model),
+            init_state,
+        }
+    }
+
+    #[cfg(feature = "npu")]
+    pub fn npu_engine(&self) -> crate::openvino::NpuEngine {
+        match &self.engine {
+            Engine::Npu(_) => crate::openvino::NpuEngine::Npu,
+            _ => crate::openvino::NpuEngine::Onnx,
         }
     }
 
@@ -176,12 +199,17 @@ impl Model {
         spec_e: &mut [f32; SPEC_LEN],
         state_out: &mut Vec<f32>,
     ) -> Result<(), String> {
-        // A single-arm match without the `native` feature.
-        #[cfg_attr(not(feature = "native"), allow(clippy::infallible_destructuring_match))]
+        // A single-arm match without the `native` or `npu` features.
+        #[cfg_attr(
+            not(any(feature = "native", feature = "npu")),
+            allow(clippy::infallible_destructuring_match)
+        )]
         let session = match &mut self.engine {
             Engine::Onnx(s) => s,
             #[cfg(feature = "native")]
             Engine::Native(n) => return n.run(spec, state_in, spec_e, state_out),
+            #[cfg(feature = "npu")]
+            Engine::Npu(ov) => return ov.run(spec, state_in, spec_e, state_out),
         };
         let spec_t = TensorRef::from_array_view(([1usize, 1, FREQ_BINS, 2], spec.as_slice()))
             .map_err(|e| e.to_string())?;

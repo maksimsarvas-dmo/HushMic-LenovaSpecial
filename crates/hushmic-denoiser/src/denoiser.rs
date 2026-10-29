@@ -24,6 +24,9 @@ pub struct Denoiser {
     /// Why a native engine was asked for but ONNX runs.
     #[cfg(feature = "native")]
     fallback_reason: Option<String>,
+    /// Why an OpenVINO NPU engine was asked for but ONNX runs.
+    #[cfg(feature = "npu")]
+    npu_fallback_reason: Option<String>,
 }
 
 impl Denoiser {
@@ -105,6 +108,44 @@ impl Denoiser {
         self.fallback_reason.as_deref()
     }
 
+    /// Load a model file and run it on the OpenVINO `NPU` device when
+    /// `inference` selects it (`Auto` or `Npu`), falling back to ONNX Runtime
+    /// CPU and recording [`Denoiser::npu_fallback_reason`] if `openvino_c` or
+    /// the `NPU` device is unavailable (feature `npu`).
+    #[cfg(feature = "npu")]
+    pub fn from_file_npu(
+        model_path: impl AsRef<Path>,
+        inference: crate::NpuInference,
+        cache_dir: Option<&Path>,
+    ) -> Result<Denoiser, Error> {
+        let model_path = model_path.as_ref();
+        if inference == crate::NpuInference::Onnx {
+            return Denoiser::from_file(model_path);
+        }
+        match crate::openvino::OpenVinoModel::load(model_path, inference, cache_dir) {
+            Ok((m, init_state)) => Ok(Denoiser::with_model(Model::npu(m, init_state))),
+            Err(why) => {
+                let mut d = Denoiser::from_file(model_path)?;
+                d.npu_fallback_reason = Some(why);
+                Ok(d)
+            }
+        }
+    }
+
+    /// Which backend (`Npu` or `Onnx`) this instance runs on (feature `npu`).
+    #[cfg(feature = "npu")]
+    pub fn npu_engine(&self) -> crate::NpuEngine {
+        self.model.npu_engine()
+    }
+
+    /// Why this instance runs ONNX Runtime CPU although [`Denoiser::from_file_npu`]
+    /// asked for the OpenVINO `NPU` backend (feature `npu`); `None` when it
+    /// got the engine it asked for.
+    #[cfg(feature = "npu")]
+    pub fn npu_fallback_reason(&self) -> Option<&str> {
+        self.npu_fallback_reason.as_deref()
+    }
+
     fn with_model(model: Model) -> Denoiser {
         let state = model.init_state.clone();
         let state_out = vec![0f32; model.state_size];
@@ -122,6 +163,8 @@ impl Denoiser {
             attn_limit_db: f32::INFINITY,
             #[cfg(feature = "native")]
             fallback_reason: None,
+            #[cfg(feature = "npu")]
+            npu_fallback_reason: None,
         }
     }
 

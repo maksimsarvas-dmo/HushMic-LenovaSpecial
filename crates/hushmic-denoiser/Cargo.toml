@@ -25,6 +25,10 @@ load-dynamic = ["ort/load-dynamic", "dep:libloading"]
 # Off by default so the crate's default API and build needs stay as they
 # are; HushMic's plugin turns it on.
 native = ["dep:cc", "dep:sha2"]
+# Optional Intel NPU backend via OpenVINO C API (openvino_c.dll), loaded at
+# runtime with libloading; falls back to ONNX Runtime with a reason when the
+# OpenVINO runtime or NPU device is absent. Enabled by hushmic-win.
+npu = ["dep:libloading"]
 
 [dependencies]
 rustfft = "6"
