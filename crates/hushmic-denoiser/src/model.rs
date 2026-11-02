@@ -26,6 +26,8 @@ enum Engine {
     Native(crate::native::NativeModel),
     #[cfg(feature = "npu")]
     Npu(crate::openvino::OpenVinoModel),
+    #[cfg(feature = "npu")]
+    Hybrid(crate::hybrid::HybridModel),
 }
 
 fn parse_csv_f32(s: &str) -> Vec<f32> {
@@ -38,7 +40,7 @@ fn parse_csv_f32(s: &str) -> Vec<f32> {
 /// committed runtime environment before touching `Session::builder()` (ort's
 /// API bootstrap would otherwise retry the dylib load itself and PANIC on
 /// failure) — `crate::runtime::ensure_runtime` guarantees that.
-fn session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
+pub(crate) fn session_builder() -> Result<ort::session::builder::SessionBuilder, String> {
     let builder = Session::builder().map_err(|e| e.to_string())?;
     keep_environment();
     builder
@@ -161,7 +163,7 @@ impl Model {
             Engine::Onnx(_) => None,
             Engine::Native(n) => Some(n.kernels),
             #[cfg(feature = "npu")]
-            Engine::Npu(_) => None,
+            Engine::Npu(_) | Engine::Hybrid(_) => None,
         }
     }
 
@@ -171,7 +173,7 @@ impl Model {
             Engine::Onnx(_) => crate::native::Engine::Onnx,
             Engine::Native(n) => n.engine,
             #[cfg(feature = "npu")]
-            Engine::Npu(_) => crate::native::Engine::Onnx,
+            Engine::Npu(_) | Engine::Hybrid(_) => crate::native::Engine::Onnx,
         }
     }
 
@@ -185,9 +187,18 @@ impl Model {
     }
 
     #[cfg(feature = "npu")]
+    pub fn hybrid(model: crate::hybrid::HybridModel, init_state: Vec<f32>) -> Model {
+        Model {
+            state_size: model.state_size(),
+            engine: Engine::Hybrid(model),
+            init_state,
+        }
+    }
+
+    #[cfg(feature = "npu")]
     pub fn npu_engine(&self) -> crate::openvino::NpuEngine {
         match &self.engine {
-            Engine::Npu(_) => crate::openvino::NpuEngine::Npu,
+            Engine::Npu(_) | Engine::Hybrid(_) => crate::openvino::NpuEngine::Npu,
             _ => crate::openvino::NpuEngine::Onnx,
         }
     }
@@ -210,6 +221,8 @@ impl Model {
             Engine::Native(n) => return n.run(spec, state_in, spec_e, state_out),
             #[cfg(feature = "npu")]
             Engine::Npu(ov) => return ov.run(spec, state_in, spec_e, state_out),
+            #[cfg(feature = "npu")]
+            Engine::Hybrid(h) => return h.run(spec, state_in, spec_e, state_out),
         };
         let spec_t = TensorRef::from_array_view(([1usize, 1, FREQ_BINS, 2], spec.as_slice()))
             .map_err(|e| e.to_string())?;

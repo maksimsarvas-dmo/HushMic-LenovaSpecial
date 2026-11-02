@@ -7,8 +7,8 @@ use hushmic_denoiser::{Denoiser, NpuInference, StreamDenoiser, HOP, SAMPLE_RATE}
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// E16 NPU qualification threshold from the architecture plan: p99 <= 8.0 ms per 10 ms hop.
-pub const NPU_P99_GATE_MS: f64 = 8.0;
+/// E16 NPU qualification threshold: p99 <= 8.0 ms per 10 ms hop.
+pub const NPU_P99_GATE_MS: f64 = hushmic_denoiser::NPU_HOP_GATE_MS;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct BenchOptions {

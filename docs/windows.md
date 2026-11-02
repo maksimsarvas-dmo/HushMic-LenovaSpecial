@@ -84,17 +84,25 @@ When moving this repository to the **ThinkPad E16 Gen 3 (Intel Core Ultra)**:
    - Open Windows **Device Manager** -> **Neural processors** and confirm **Intel(R) AI Boost** (or **Intel(R) NPU Accelerator**) is enabled and updated via Windows Update / Lenovo Vantage.
 2. **Install OpenVINO Runtime for Windows:**
    - Download the OpenVINO 2025/2026 C/C++ runtime archive for Windows x86_64 and add its `runtime\bin\intel64\Release` folder to `PATH` (or place `openvino_c.dll` next to `hushmic-win.exe`).
-3. **Run the Hop-Time Qualification Benchmark:**
+3. **Split the model for the NPU (required for correct output):**
+   The Intel NPU runs the model's input feature block (`Pow`, `ReduceSum`, `Sqrt`, `Log`, `Div`) wrongly in FP16, so the whole graph on the NPU produces garbage after a few hops (3-8 dB SNR versus ONNX). Cut the model at its first `Conv`: the feature block stays on the CPU (about 0.13 ms per hop) and the convolution/GRU body runs on the NPU.
    ```powershell
-   hushmic-win bench --engine npu --model quality --hops 1000
+   pip install onnx
+   python scripts\split-npu-model.py assets\models\dpdfnet2_48khz_hr.onnx
+   ```
+   Copy the generated `*.front.onnx`, `*.body.onnx` and `*.split.txt` files next to the model. Without them, `--engine npu` compiles the whole graph (wrong output) and `--engine auto` falls back to ONNX CPU.
+   Measured on a Core Ultra 5 125U: the `light` model reaches 38-44 dB waveform SNR versus ONNX and uses roughly 4-5x less CPU time per hop than ONNX CPU. The `quality` model is accurate but too slow on this NPU (body about 14 ms per 10 ms hop), so it stays on the CPU.
+4. **Run the Hop-Time Qualification Benchmark:**
+   ```powershell
+   hushmic-win bench --engine npu --model light --hops 1000
    ```
    - Confirm `active_engine: openvino npu` is reported (no `fallback_reason`).
    - Confirm `qual_gate (p99 <= 8.0 ms): PASS`. First run populates `%LOCALAPPDATA%\HushMic\ov-cache`; subsequent starts load the cached NPU blob immediately.
-4. **Install VB-Audio Virtual Cable:**
+5. **Install VB-Audio Virtual Cable:**
    - Install VB-Cable so Windows has `CABLE Input` (playback) and `CABLE Output` (recording).
    - Start `hushmic-win` and select **`CABLE Output`** as the microphone inside Microsoft Teams, Zoom, Discord, or your browser.
-5. **Disable Competing Built-in Suppressors on the Physical Mic:**
+6. **Disable Competing Built-in Suppressors on the Physical Mic:**
    - Turn off **Windows Studio Effects -> Voice Focus** and **Lenovo Vantage Smart Noise Cancellation** on the raw microphone endpoint so two neural suppressors are not stacked in series.
-6. **Production Follow-ups on Hardware:**
+7. **Production Follow-ups on Hardware:**
    - **Signed WaveRT Virtual Microphone Driver:** Replace VB-Cable with an EV-signed WaveRT virtual audio driver so **HushMic** appears directly as a native Windows microphone endpoint.
    - **NNCF INT8 Calibration:** If `dpdfnet8_48khz_hr` in FP16 on a given NPU driver revision exceeds the 8 ms p99 gate or you want lower package power, quantize the spectral ONNX weights to INT8 with OpenVINO NNCF against speech+noise calibration clips and verify waveform SNR >= 30 dB and DNSMOS drop <= 0.05.

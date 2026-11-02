@@ -111,7 +111,9 @@ impl Denoiser {
     /// Load a model file and run it on the OpenVINO `NPU` device when
     /// `inference` selects it (`Auto` or `Npu`), falling back to ONNX Runtime
     /// CPU and recording [`Denoiser::npu_fallback_reason`] if `openvino_c` or
-    /// the `NPU` device is unavailable (feature `npu`).
+    /// the `NPU` device is unavailable (feature `npu`). `Auto` also falls
+    /// back when a short on-device probe misses [`crate::NPU_HOP_GATE_MS`]
+    /// or the NPU waveform is more than 30 dB away from ONNX Runtime.
     #[cfg(feature = "npu")]
     pub fn from_file_npu(
         model_path: impl AsRef<Path>,
@@ -122,13 +124,31 @@ impl Denoiser {
         if inference == crate::NpuInference::Onnx {
             return Denoiser::from_file(model_path);
         }
-        match crate::openvino::OpenVinoModel::load(model_path, inference, cache_dir) {
-            Ok((m, init_state)) => Ok(Denoiser::with_model(Model::npu(m, init_state))),
-            Err(why) => {
-                let mut d = Denoiser::from_file(model_path)?;
-                d.npu_fallback_reason = Some(why);
-                Ok(d)
+        // The NPU gets the feature block wrong in FP16, so when the split
+        // sidecars exist (scripts/split-npu-model.py) the feature block runs
+        // on CPU and only the body runs on the NPU.
+        let loaded = if crate::hybrid::split_available(model_path) {
+            crate::runtime::ensure_runtime()?;
+            crate::hybrid::HybridModel::load(model_path, cache_dir)
+                .map(|(m, init_state)| Model::hybrid(m, init_state))
+        } else {
+            crate::openvino::OpenVinoModel::load(model_path, inference, cache_dir)
+                .map(|(m, init_state)| Model::npu(m, init_state))
+        };
+        match loaded {
+            Ok(model) => {
+                let mut d = Denoiser::with_model(model);
+                // Explicit `npu` keeps the device even when it misses the hop
+                // budget, so qualification benches can report that result.
+                // `auto` must stay real-time, so a slow NPU yields the CPU.
+                if inference == crate::NpuInference::Auto {
+                    auto_select(d, model_path)
+                } else {
+                    d.reset();
+                    Ok(d)
+                }
             }
+            Err(why) => onnx_npu_fallback(model_path, why),
         }
     }
 
@@ -254,4 +274,109 @@ impl Denoiser {
         self.gain.process(output); // mute ramp, after synthesis
         result.map_err(Error::Inference)
     }
+}
+
+#[cfg(feature = "npu")]
+fn onnx_npu_fallback(model_path: &Path, why: String) -> Result<Denoiser, Error> {
+    let mut d = Denoiser::from_file(model_path)?;
+    d.npu_fallback_reason = Some(why);
+    Ok(d)
+}
+
+/// Architecture parity floor: NPU output versus the ONNX Runtime reference.
+const NPU_PARITY_SNR_DB: f64 = 30.0;
+
+/// Keep the NPU only when it is fast enough and numerically close to ONNX.
+#[cfg(feature = "npu")]
+fn auto_select(mut npu: Denoiser, model_path: &Path) -> Result<Denoiser, Error> {
+    let mut cpu = Denoiser::from_file(model_path)?;
+    let (median_ms, snr_db) = match parity_probe(&mut npu, &mut cpu) {
+        Ok(stats) => stats,
+        Err(err) => {
+            cpu.npu_fallback_reason = Some(format!("NPU hop probe failed: {err}"));
+            return Ok(cpu);
+        }
+    };
+    let latency_ok = median_ms <= crate::NPU_HOP_GATE_MS;
+    let parity_ok = snr_db >= NPU_PARITY_SNR_DB;
+    if latency_ok && parity_ok {
+        npu.reset();
+        return Ok(npu);
+    }
+    let mut why = Vec::new();
+    if !latency_ok {
+        why.push(format!(
+            "hop median {median_ms:.2} ms exceeds {:.1} ms real-time gate",
+            crate::NPU_HOP_GATE_MS
+        ));
+    }
+    if !parity_ok {
+        why.push(format!(
+            "waveform SNR vs ONNX {snr_db:.1} dB is below {NPU_PARITY_SNR_DB:.0} dB"
+        ));
+    }
+    cpu.reset();
+    cpu.npu_fallback_reason = Some(format!("NPU {}", why.join("; ")));
+    Ok(cpu)
+}
+
+/// Same hops through both engines. Returns `(npu median ms, SNR of NPU vs ONNX)`.
+///
+/// The probe signal is continuous voiced harmonics with vibrato, gated on and
+/// off, over deterministic noise: the model passes the voiced part, so the
+/// compared output is not near-silence (a bare sine or a repeated hop is
+/// treated as noise and gated, which makes an SNR figure meaningless).
+/// Latency is judged by the median: tail latency under system load hits the
+/// CPU path just as much, and the median is what the device can sustain.
+#[cfg(feature = "npu")]
+fn parity_probe(npu: &mut Denoiser, cpu: &mut Denoiser) -> Result<(f64, f64), Error> {
+    const WARMUP: usize = 16;
+    const MEASURED: usize = 64;
+    let sample_rate = crate::SAMPLE_RATE as f32;
+    let tau = 2.0 * std::f32::consts::PI;
+    let mut phase = 0.0f32;
+    let mut lcg: u32 = 0x1234_5678;
+    let mut hop_in = [0.0f32; HOP];
+    let mut npu_out = [0.0f32; HOP];
+    let mut cpu_out = [0.0f32; HOP];
+    let mut signal = 0.0f64;
+    let mut error = 0.0f64;
+    let mut times = Vec::with_capacity(MEASURED);
+    for hop in 0..(WARMUP + MEASURED) {
+        for (i, sample) in hop_in.iter_mut().enumerate() {
+            let t = ((hop * HOP + i) as f32) / sample_rate;
+            let f0 = 150.0 + 25.0 * (tau * 2.5 * t).sin();
+            phase = (phase + tau * f0 / sample_rate) % tau;
+            let voice = 0.2 * phase.sin()
+                + 0.14 * (2.0 * phase).sin()
+                + 0.1 * (3.0 * phase).sin()
+                + 0.06 * (4.0 * phase).sin()
+                + 0.04 * (5.0 * phase).sin();
+            let gate = ((tau * 1.2 * t).sin() * 4.0).clamp(0.0, 1.0);
+            lcg = lcg.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let noise = (lcg >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+            *sample = voice * gate + 0.05 * noise + 0.02 * (tau * 120.0 * t).sin();
+        }
+        let started = std::time::Instant::now();
+        npu.process_hop(&hop_in, &mut npu_out)?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        cpu.process_hop(&hop_in, &mut cpu_out)?;
+        if hop >= WARMUP {
+            times.push(elapsed_ms);
+            for i in 0..HOP {
+                let reference = f64::from(cpu_out[i]);
+                let delta = f64::from(npu_out[i]) - reference;
+                signal += reference * reference;
+                error += delta * delta;
+            }
+        }
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = times[times.len() / 2];
+    let snr_db = if error <= 1e-20 {
+        120.0
+    } else {
+        10.0 * (signal / error).log10()
+    };
+    Ok((median, snr_db))
 }

@@ -18,6 +18,10 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
+/// Real-time gate for one 10 ms hop. `NpuInference::Auto` falls back to ONNX
+/// Runtime when an on-device NPU probe's p99 exceeds this.
+pub const NPU_HOP_GATE_MS: f64 = 8.0;
+
 /// Which inference backend [`Denoiser::from_file_npu`](crate::Denoiser::from_file_npu) selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NpuInference {
@@ -108,12 +112,16 @@ type FnCoreSetProperty = unsafe extern "C" fn(
     *const c_char,
     *const c_char,
 ) -> OvStatus;
+/// Up to three key/value pairs. Unused slots are passed as null and are not
+/// read when `property_args_size` counts only the pairs that are set.
 type FnCoreCompileModelFromFile = unsafe extern "C" fn(
     *const OvCore,
     *const c_char,
     *const c_char,
     usize,
     *mut *mut OvCompiledModel,
+    *const c_char,
+    *const c_char,
     *const c_char,
     *const c_char,
     *const c_char,
@@ -130,6 +138,16 @@ type FnTensorData = unsafe extern "C" fn(*const OvTensor, *mut *mut c_void) -> O
 type FnTensorGetSize = unsafe extern "C" fn(*const OvTensor, *mut usize) -> OvStatus;
 type FnTensorFree = unsafe extern "C" fn(*mut OvTensor);
 type FnGetErrorInfo = unsafe extern "C" fn(OvStatus) -> *const c_char;
+type FnGetLastErrMsg = unsafe extern "C" fn() -> *const c_char;
+type FnGetAvailableDevices =
+    unsafe extern "C" fn(*const OvCore, *mut OvAvailableDevices) -> OvStatus;
+type FnAvailableDevicesFree = unsafe extern "C" fn(*mut OvAvailableDevices);
+
+#[repr(C)]
+struct OvAvailableDevices {
+    devices: *mut *mut c_char,
+    size: usize,
+}
 
 /// Dynamically loaded function table for `openvino_c`.
 struct OvApi {
@@ -147,6 +165,9 @@ struct OvApi {
     tensor_get_size: FnTensorGetSize,
     tensor_free: FnTensorFree,
     get_error_info: Option<FnGetErrorInfo>,
+    get_last_err_msg: Option<FnGetLastErrMsg>,
+    get_available_devices: Option<FnGetAvailableDevices>,
+    available_devices_free: Option<FnAvailableDevicesFree>,
 }
 
 impl OvApi {
@@ -204,6 +225,18 @@ impl OvApi {
             .get::<FnGetErrorInfo>(b"ov_get_error_info\0")
             .ok()
             .map(|s| *s);
+        let get_last_err_msg = lib
+            .get::<FnGetLastErrMsg>(b"ov_get_last_err_msg\0")
+            .ok()
+            .map(|s| *s);
+        let get_available_devices = lib
+            .get::<FnGetAvailableDevices>(b"ov_core_get_available_devices\0")
+            .ok()
+            .map(|s| *s);
+        let available_devices_free = lib
+            .get::<FnAvailableDevicesFree>(b"ov_available_devices_free\0")
+            .ok()
+            .map(|s| *s);
 
         Ok(OvApi {
             _lib: lib,
@@ -220,10 +253,28 @@ impl OvApi {
             tensor_get_size,
             tensor_free,
             get_error_info,
+            get_last_err_msg,
+            get_available_devices,
+            available_devices_free,
         })
     }
 
     fn status_message(&self, status: OvStatus) -> String {
+        // ov_get_last_err_msg carries the C++ exception text (unsupported op,
+        // rejected property, missing device). ov_get_error_info is only the
+        // status-code name.
+        if let Some(f) = self.get_last_err_msg {
+            // SAFETY: returns a C string owned by OpenVINO for the last error
+            // on this thread. Copied into a Rust String before further calls.
+            let ptr = unsafe { f() };
+            if !ptr.is_null() {
+                if let Ok(s) = unsafe { CStr::from_ptr(ptr) }.to_str() {
+                    if !s.is_empty() {
+                        return format!("{s} (status {status})");
+                    }
+                }
+            }
+        }
         if let Some(f) = self.get_error_info {
             // SAFETY: ov_get_error_info returns a static C string for status codes.
             let ptr = unsafe { f(status) };
@@ -234,6 +285,75 @@ impl OvApi {
             }
         }
         format!("OpenVINO status {status}")
+    }
+
+    fn available_device_names(&self, core: *const OvCore) -> Option<Vec<String>> {
+        let (Some(get), Some(free)) = (self.get_available_devices, self.available_devices_free)
+        else {
+            return None;
+        };
+        let mut list = OvAvailableDevices {
+            devices: std::ptr::null_mut(),
+            size: 0,
+        };
+        // SAFETY: `core` is a live ov_core_t; the list is freed before return.
+        let status = unsafe { get(core, &mut list) };
+        if status != OV_OK {
+            return None;
+        }
+        let mut names = Vec::with_capacity(list.size);
+        if !list.devices.is_null() {
+            for i in 0..list.size {
+                // SAFETY: OpenVINO allocated `size` C strings in `devices`.
+                let p = unsafe { *list.devices.add(i) };
+                if !p.is_null() {
+                    if let Ok(s) = unsafe { CStr::from_ptr(p) }.to_str() {
+                        names.push(s.to_string());
+                    }
+                }
+            }
+        }
+        unsafe { free(&mut list) };
+        Some(names)
+    }
+
+    /// Compile `model_path` for `device`. `props` is at most three key/value pairs.
+    unsafe fn compile_from_file(
+        &self,
+        core: *const OvCore,
+        model_path: *const c_char,
+        device: *const c_char,
+        props: &[(*const c_char, *const c_char)],
+    ) -> Result<NonNull<OvCompiledModel>, String> {
+        if props.len() > 3 {
+            return Err(format!(
+                "OpenVINO compile supports at most 3 properties, got {}",
+                props.len()
+            ));
+        }
+        let mut slots = [std::ptr::null(); 6];
+        for (i, (k, v)) in props.iter().enumerate() {
+            slots[i * 2] = *k;
+            slots[i * 2 + 1] = *v;
+        }
+        let mut raw_compiled: *mut OvCompiledModel = std::ptr::null_mut();
+        let status = (self.core_compile_model_from_file)(
+            core,
+            model_path,
+            device,
+            props.len() * 2,
+            &mut raw_compiled,
+            slots[0],
+            slots[1],
+            slots[2],
+            slots[3],
+            slots[4],
+            slots[5],
+        );
+        self.check(status, "ov_core_compile_model_from_file(NPU)")?;
+        NonNull::new(raw_compiled).ok_or_else(|| {
+            "ov_core_compile_model_from_file(NPU) returned null".to_string()
+        })
     }
 
     fn check(&self, status: OvStatus, context: &str) -> Result<(), String> {
@@ -279,8 +399,8 @@ pub(crate) struct OpenVinoModel {
     core: NonNull<OvCore>,
     compiled: NonNull<OvCompiledModel>,
     request: NonNull<OvInferRequest>,
-    spec_tensor: NonNull<OvTensor>,
-    state_in_tensor: NonNull<OvTensor>,
+    /// Input tensors in the order `run_feeds` expects them, with element counts.
+    inputs: Vec<(NonNull<OvTensor>, usize)>,
     spec_e_tensor: NonNull<OvTensor>,
     state_out_tensor: NonNull<OvTensor>,
     state_size: usize,
@@ -296,8 +416,9 @@ impl Drop for OpenVinoModel {
         // SAFETY: handles were created by this `api` instance and are freed in
         // reverse dependency order (tensors -> infer_request -> compiled_model -> core).
         unsafe {
-            (self.api.tensor_free)(self.spec_tensor.as_ptr());
-            (self.api.tensor_free)(self.state_in_tensor.as_ptr());
+            for (t, _) in &self.inputs {
+                (self.api.tensor_free)(t.as_ptr());
+            }
             (self.api.tensor_free)(self.spec_e_tensor.as_ptr());
             (self.api.tensor_free)(self.state_out_tensor.as_ptr());
             (self.api.infer_request_free)(self.request.as_ptr());
@@ -322,8 +443,28 @@ impl OpenVinoModel {
         if inference == NpuInference::Onnx {
             return Err("ONNX requested".into());
         }
+        Self::load_graph(
+            onnx_path,
+            onnx_path,
+            cache_dir,
+            &["spec".to_string(), "state_in".to_string()],
+        )
+    }
+
+    /// Compile `graph_path` for the NPU. `meta_path` is the original full
+    /// model whose custom metadata seeds the recurrent state (a split body
+    /// graph does not carry it). `input_names` fixes the order in which
+    /// [`OpenVinoModel::run_feeds`] expects its feeds; it must contain
+    /// `state_in`.
+    pub(crate) fn load_graph(
+        graph_path: &Path,
+        meta_path: &Path,
+        cache_dir: Option<&Path>,
+        input_names: &[String],
+    ) -> Result<(OpenVinoModel, Vec<f32>), String> {
+        let onnx_path = graph_path;
         let onnx_bytes =
-            std::fs::read(onnx_path).map_err(|e| format!("read {}: {e}", onnx_path.display()))?;
+            std::fs::read(meta_path).map_err(|e| format!("read {}: {e}", meta_path.display()))?;
         let meta = parse_onnx_custom_metadata(&onnx_bytes);
 
         let api = OvApi::load()?;
@@ -334,22 +475,38 @@ impl OpenVinoModel {
         let core = NonNull::new(raw_core).ok_or("ov_core_create returned null")?;
 
         let device = CString::new("NPU").unwrap();
-        if let Some(dir) = cache_dir {
-            let _ = std::fs::create_dir_all(dir);
-            if let Ok(c_dir) = CString::new(dir.to_string_lossy().as_bytes()) {
-                let key = CString::new("CACHE_DIR").unwrap();
-                // SAFETY: sets CACHE_DIR on the NPU plugin before compilation;
-                // trailing null terminates the variadic property list.
-                let _ = unsafe {
-                    (api.core_set_property)(
-                        core.as_ptr(),
-                        device.as_ptr(),
-                        key.as_ptr(),
-                        c_dir.as_ptr(),
-                        std::ptr::null(),
-                    )
+        if let Some(names) = api.available_device_names(core.as_ptr()) {
+            let has_npu = names.iter().any(|n| n.to_ascii_uppercase().contains("NPU"));
+            if !has_npu {
+                let listed = if names.is_empty() {
+                    "(none)".to_string()
+                } else {
+                    names.join(", ")
                 };
+                unsafe { (api.core_free)(core.as_ptr()) };
+                return Err(format!(
+                    "OpenVINO has no NPU device (available: {listed}). Intel AI Boost driver or openvino_intel_npu_plugin.dll is missing"
+                ));
             }
+        }
+
+        let cache_cstring = cache_dir.and_then(|dir| {
+            let _ = std::fs::create_dir_all(dir);
+            CString::new(dir.to_string_lossy().as_bytes()).ok()
+        });
+        if let Some(c_dir) = &cache_cstring {
+            let key = CString::new("CACHE_DIR").unwrap();
+            // SAFETY: one CACHE_DIR pair. ov_core_set_property reads a single
+            // key/value from the variadic tail; the trailing null is unused.
+            let _ = unsafe {
+                (api.core_set_property)(
+                    core.as_ptr(),
+                    device.as_ptr(),
+                    key.as_ptr(),
+                    c_dir.as_ptr(),
+                    std::ptr::null(),
+                )
+            };
         }
 
         let c_model_path = CString::new(onnx_path.to_string_lossy().as_bytes())
@@ -358,30 +515,64 @@ impl OpenVinoModel {
         let v_hint = CString::new("LATENCY").unwrap();
         let k_streams = CString::new("NUM_STREAMS").unwrap();
         let v_streams = CString::new("1").unwrap();
+        let k_cache = CString::new("CACHE_DIR").unwrap();
 
-        let mut raw_compiled: *mut OvCompiledModel = std::ptr::null_mut();
-        // SAFETY: compiles the model on NPU with 4 property string arguments
-        // (2 key-value pairs: PERFORMANCE_HINT=LATENCY, NUM_STREAMS=1).
-        let status = unsafe {
-            (api.core_compile_model_from_file)(
-                core.as_ptr(),
-                c_model_path.as_ptr(),
-                device.as_ptr(),
-                4,
-                &mut raw_compiled,
-                k_hint.as_ptr(),
-                v_hint.as_ptr(),
-                k_streams.as_ptr(),
-                v_streams.as_ptr(),
-            )
-        };
-        if let Err(e) = api.check(status, "ov_core_compile_model_from_file(NPU)") {
-            unsafe { (api.core_free)(core.as_ptr()) };
-            return Err(e);
+        // Some NPU driver revisions reject NUM_STREAMS. Retry without it, and
+        // keep CACHE_DIR on the compile call so the blob is written even when
+        // the earlier set_property was ignored.
+        let mut attempts: Vec<Vec<(*const c_char, *const c_char)>> = Vec::new();
+        let mut full = vec![
+            (k_hint.as_ptr(), v_hint.as_ptr()),
+            (k_streams.as_ptr(), v_streams.as_ptr()),
+        ];
+        let mut latency_only = vec![(k_hint.as_ptr(), v_hint.as_ptr())];
+        if let Some(c_dir) = &cache_cstring {
+            full.push((k_cache.as_ptr(), c_dir.as_ptr()));
+            latency_only.push((k_cache.as_ptr(), c_dir.as_ptr()));
         }
-        let Some(compiled) = NonNull::new(raw_compiled) else {
+        attempts.push(full);
+        attempts.push(latency_only);
+        if cache_cstring.is_some() {
+            attempts.push(vec![(k_cache.as_ptr(), cache_cstring.as_ref().unwrap().as_ptr())]);
+        } else {
+            attempts.push(Vec::new());
+        }
+
+        let mut compiled = None;
+        let mut last_err = String::from("OpenVINO NPU compile was not attempted");
+        for (i, props) in attempts.iter().enumerate() {
+            // SAFETY: `core` is live and `props` holds at most three pairs of
+            // pointers into the CStrings above.
+            match unsafe {
+                api.compile_from_file(
+                    core.as_ptr(),
+                    c_model_path.as_ptr(),
+                    device.as_ptr(),
+                    props,
+                )
+            } {
+                Ok(model) => {
+                    if i > 0 {
+                        eprintln!(
+                            "hushmic-denoiser: NPU compile succeeded after dropping a rejected property ({last_err})"
+                        );
+                    }
+                    compiled = Some(model);
+                    break;
+                }
+                Err(e) => {
+                    let rejected_property = e.to_ascii_lowercase().contains("num_streams")
+                        || e.to_ascii_lowercase().contains("property");
+                    last_err = e;
+                    if !rejected_property {
+                        break;
+                    }
+                }
+            }
+        }
+        let Some(compiled) = compiled else {
             unsafe { (api.core_free)(core.as_ptr()) };
-            return Err("ov_core_compile_model_from_file(NPU) returned null".into());
+            return Err(last_err);
         };
 
         let mut raw_req: *mut OvInferRequest = std::ptr::null_mut();
@@ -428,28 +619,36 @@ impl OpenVinoModel {
             (api.core_free)(core.as_ptr());
         };
 
-        let (spec_tensor, spec_len) = match get_tensor("spec") {
-            Ok(v) => v,
-            Err(e) => {
-                cleanup_req();
-                return Err(e);
+        let mut inputs: Vec<(NonNull<OvTensor>, usize)> = Vec::with_capacity(input_names.len());
+        let free_inputs = |inputs: &[(NonNull<OvTensor>, usize)]| {
+            for (t, _) in inputs {
+                unsafe { (api.tensor_free)(t.as_ptr()) };
             }
         };
-        let (state_in_tensor, state_in_len) = match get_tensor("state_in") {
-            Ok(v) => v,
-            Err(e) => {
-                unsafe { (api.tensor_free)(spec_tensor.as_ptr()) };
-                cleanup_req();
-                return Err(e);
+        for name in input_names {
+            match get_tensor(name) {
+                Ok(v) => inputs.push(v),
+                Err(e) => {
+                    free_inputs(&inputs);
+                    cleanup_req();
+                    return Err(e);
+                }
             }
+        }
+        let Some(state_idx) = input_names.iter().position(|n| n == "state_in") else {
+            free_inputs(&inputs);
+            cleanup_req();
+            return Err("OpenVINO graph input list has no 'state_in'".into());
         };
+        let state_in_len = inputs[state_idx].1;
+        let spec_len = input_names
+            .iter()
+            .position(|n| n == "spec")
+            .map_or(SPEC_LEN, |i| inputs[i].1);
         let (spec_e_tensor, spec_e_len) = match get_tensor("spec_e") {
             Ok(v) => v,
             Err(e) => {
-                unsafe {
-                    (api.tensor_free)(spec_tensor.as_ptr());
-                    (api.tensor_free)(state_in_tensor.as_ptr());
-                }
+                free_inputs(&inputs);
                 cleanup_req();
                 return Err(e);
             }
@@ -457,11 +656,8 @@ impl OpenVinoModel {
         let (state_out_tensor, state_out_len) = match get_tensor("state_out") {
             Ok(v) => v,
             Err(e) => {
-                unsafe {
-                    (api.tensor_free)(spec_tensor.as_ptr());
-                    (api.tensor_free)(state_in_tensor.as_ptr());
-                    (api.tensor_free)(spec_e_tensor.as_ptr());
-                }
+                free_inputs(&inputs);
+                unsafe { (api.tensor_free)(spec_e_tensor.as_ptr()) };
                 cleanup_req();
                 return Err(e);
             }
@@ -472,8 +668,7 @@ impl OpenVinoModel {
             core,
             compiled,
             request,
-            spec_tensor,
-            state_in_tensor,
+            inputs,
             spec_e_tensor,
             state_out_tensor,
             state_size: state_in_len,
@@ -511,38 +706,45 @@ impl OpenVinoModel {
         spec_e: &mut [f32; SPEC_LEN],
         state_out: &mut Vec<f32>,
     ) -> Result<(), String> {
-        if state_in.len() != self.state_size {
+        self.run_feeds(&[spec.as_slice(), state_in], spec_e, state_out)
+    }
+
+    /// Run one inference. `feeds` holds one slice per input, in the order of
+    /// the `input_names` given to [`OpenVinoModel::load_graph`].
+    pub(crate) fn run_feeds(
+        &mut self,
+        feeds: &[&[f32]],
+        spec_e: &mut [f32; SPEC_LEN],
+        state_out: &mut Vec<f32>,
+    ) -> Result<(), String> {
+        if feeds.len() != self.inputs.len() {
             return Err(format!(
-                "state_in length {} does not match model state_size {}",
-                state_in.len(),
-                self.state_size
+                "expected {} inputs, got {}",
+                self.inputs.len(),
+                feeds.len()
             ));
+        }
+        for (i, (feed, (_, len))) in feeds.iter().zip(&self.inputs).enumerate() {
+            if feed.len() != *len {
+                return Err(format!(
+                    "input {i} has {} elements, model expects {len}",
+                    feed.len()
+                ));
+            }
         }
 
         unsafe {
-            let mut spec_ptr: *mut c_void = std::ptr::null_mut();
-            self.api.check(
-                (self.api.tensor_data)(self.spec_tensor.as_ptr(), &mut spec_ptr),
-                "ov_tensor_data(spec)",
-            )?;
-            if spec_ptr.is_null() {
-                return Err("ov_tensor_data(spec) returned null".into());
+            for (feed, (tensor, len)) in feeds.iter().zip(&self.inputs) {
+                let mut ptr: *mut c_void = std::ptr::null_mut();
+                self.api.check(
+                    (self.api.tensor_data)(tensor.as_ptr(), &mut ptr),
+                    "ov_tensor_data(input)",
+                )?;
+                if ptr.is_null() {
+                    return Err("ov_tensor_data(input) returned null".into());
+                }
+                std::ptr::copy_nonoverlapping(feed.as_ptr(), ptr.cast::<f32>(), *len);
             }
-            std::ptr::copy_nonoverlapping(spec.as_ptr(), spec_ptr.cast::<f32>(), SPEC_LEN);
-
-            let mut state_in_ptr: *mut c_void = std::ptr::null_mut();
-            self.api.check(
-                (self.api.tensor_data)(self.state_in_tensor.as_ptr(), &mut state_in_ptr),
-                "ov_tensor_data(state_in)",
-            )?;
-            if state_in_ptr.is_null() {
-                return Err("ov_tensor_data(state_in) returned null".into());
-            }
-            std::ptr::copy_nonoverlapping(
-                state_in.as_ptr(),
-                state_in_ptr.cast::<f32>(),
-                self.state_size,
-            );
 
             self.api.check(
                 (self.api.infer_request_infer)(self.request.as_ptr()),
