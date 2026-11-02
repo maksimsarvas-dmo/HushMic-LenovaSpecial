@@ -7,9 +7,11 @@
 //! - Windows WASAPI shared event-driven capture and render threads (`#[cfg(windows)]`),
 //!   with the inference thread running `StreamDenoiser` on a 2 MiB stack under
 //!   MMCSS `"Pro Audio"`.
+//! - An activity gate so the NPU is submitted only while a call is capturing the
+//!   virtual microphone or the physical microphone rises above its noise floor.
 
-use crate::config::{Config, RunMode};
-use hushmic_denoiser::{Denoiser, HOP, LATENCY_SAMPLES, SAMPLE_RATE};
+use crate::config::{Config, NpuGate, RunMode};
+use hushmic_denoiser::{Denoiser, HOP, LATENCY_SAMPLES, NPU_HOP_GATE_MS, SAMPLE_RATE};
 use rubato::{FftFixedInOut, Resampler};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -140,6 +142,178 @@ pub fn match_device_name(candidates: &[String], query: Option<&str>) -> Option<u
         .position(|c| c.to_ascii_lowercase().contains(&q_low))
 }
 
+/// Capture-side name paired with a virtual-cable render endpoint.
+/// `"CABLE Input"` becomes `"CABLE Output"`. Real speakers have no pair.
+pub fn paired_capture_query(render_device: &str) -> Option<String> {
+    let lower = render_device.to_ascii_lowercase();
+    let idx = lower.find("input")?;
+    let mut paired = String::with_capacity(render_device.len() + 1);
+    paired.push_str(&render_device[..idx]);
+    let word = render_device.get(idx..idx + 5).unwrap_or("input");
+    if word.starts_with(|c: char| c.is_ascii_uppercase()) {
+        paired.push_str("Output");
+    } else {
+        paired.push_str("output");
+    }
+    paired.push_str(&render_device[idx + 5..]);
+    Some(paired)
+}
+
+/// Hops of room-noise calibration before the adaptive threshold is trusted (500 ms).
+const SIGNAL_LEARN_HOPS: usize = 50;
+/// Keep the model running across short pauses so words are not chopped (800 ms).
+const SIGNAL_HANGOVER_HOPS: u32 = 80;
+/// Open immediately on a loud hop (~ -30 dBFS), even during calibration.
+const SIGNAL_LOUD_RMS: f32 = 0.03162;
+/// Never open below this RMS (~ -50 dBFS).
+const SIGNAL_ABS_OPEN_RMS: f32 = 0.003162;
+/// Open when the hop is this many times the tracked room floor (~12 dB).
+const SIGNAL_SPEECH_RATIO: f32 = 4.0;
+
+/// Microphone energy gate. A steady room tone (fan, mic self-noise) stays closed
+/// after a short calibration; speech and other bursts open it.
+pub struct SignalGate {
+    learn: [f32; SIGNAL_LEARN_HOPS],
+    learned: usize,
+    noise_rms: f32,
+    hangover_left: u32,
+    open: bool,
+}
+
+impl Default for SignalGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SignalGate {
+    pub fn new() -> Self {
+        Self {
+            learn: [0.0; SIGNAL_LEARN_HOPS],
+            learned: 0,
+            noise_rms: 0.0,
+            hangover_left: 0,
+            open: false,
+        }
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Returns whether this hop should wake inference.
+    pub fn observe(&mut self, hop: &[f32]) -> bool {
+        let mut acc = 0.0f32;
+        for sample in hop {
+            acc += sample * sample;
+        }
+        let rms = if hop.is_empty() {
+            0.0
+        } else {
+            (acc / hop.len() as f32).sqrt()
+        };
+        let rms = if rms.is_finite() { rms } else { 0.0 };
+
+        let threshold = if self.learned < SIGNAL_LEARN_HOPS {
+            self.learn[self.learned] = rms;
+            self.learned += 1;
+            if self.learned == SIGNAL_LEARN_HOPS {
+                let mut sorted = self.learn;
+                sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                self.noise_rms = sorted[SIGNAL_LEARN_HOPS / 5];
+            }
+            SIGNAL_LOUD_RMS
+        } else {
+            if rms < self.noise_rms {
+                self.noise_rms += (rms - self.noise_rms) * 0.08;
+            } else if !self.open {
+                self.noise_rms += (rms - self.noise_rms) * 0.001;
+            }
+            (self.noise_rms * SIGNAL_SPEECH_RATIO).max(SIGNAL_ABS_OPEN_RMS)
+        };
+
+        if rms >= threshold {
+            self.open = true;
+            self.hangover_left = SIGNAL_HANGOVER_HOPS;
+        } else if self.hangover_left > 0 {
+            self.hangover_left -= 1;
+            self.open = true;
+        } else {
+            self.open = false;
+        }
+        self.open
+    }
+}
+
+/// What one hop should do with the neural net.
+struct HopDecision {
+    run_npu: bool,
+    /// When inference is skipped, copy latency-aligned raw audio instead of silence.
+    passthrough: bool,
+    reason: &'static str,
+}
+
+fn decide_hop(
+    gate: NpuGate,
+    enabled: bool,
+    mode: RunMode,
+    call_active: Option<bool>,
+    signal_open: bool,
+) -> HopDecision {
+    if mode == RunMode::Mute && enabled {
+        return HopDecision {
+            run_npu: false,
+            passthrough: false,
+            reason: "mute",
+        };
+    }
+    if !enabled {
+        return HopDecision {
+            run_npu: false,
+            passthrough: true,
+            reason: "off",
+        };
+    }
+    if mode == RunMode::Bypass {
+        return HopDecision {
+            run_npu: false,
+            passthrough: true,
+            reason: "bypass",
+        };
+    }
+
+    let call = call_active == Some(true);
+    let run = match gate {
+        NpuGate::Always => true,
+        NpuGate::Call => call,
+        NpuGate::Signal => signal_open,
+        NpuGate::Auto => call || signal_open,
+    };
+    let reason = if !run {
+        "idle"
+    } else if gate == NpuGate::Always {
+        "always"
+    } else if call && gate != NpuGate::Signal {
+        "call"
+    } else {
+        "signal"
+    };
+    HopDecision {
+        run_npu: run,
+        // Idle still forwards the microphone. Only Mute replaces it with silence.
+        passthrough: true,
+        reason,
+    }
+}
+
+/// Linear fade of one hop down to silence, used on the first idle hop after inference.
+fn fade_out(from: &[f32; HOP], out: &mut [f32; HOP]) {
+    let inv = 1.0 / HOP as f32;
+    for (i, (dst, src)) in out.iter_mut().zip(from.iter()).enumerate() {
+        *dst = src * (1.0 - i as f32 * inv);
+    }
+}
+
 /// Bounded queue carrying 48 kHz mono samples from the WASAPI capture callback
 /// to the inference thread.
 pub struct HopQueue {
@@ -186,6 +360,14 @@ impl HopQueue {
         self.cv.notify_one();
     }
 
+    /// Drop samples still waiting. Used when the capture device changes so the
+    /// previous microphone does not keep playing.
+    pub fn clear(&self) {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.samples.clear();
+        self.cv.notify_all();
+    }
+
     /// Pop exactly one 480-sample hop, waiting up to `timeout` for a full hop.
     pub fn pop_hop(&self, out: &mut [f32; HOP], timeout: std::time::Duration) -> Option<bool> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -225,16 +407,16 @@ impl HopQueue {
 /// Outcome of [`LateHopGuard::observe_hop`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LateOutcome {
-    /// Hop finished within the 10 ms period.
+    /// Hop finished within [`NPU_HOP_GATE_MS`].
     OnTime,
-    /// First consecutive late hop (> 10 ms): absorbed by the 10 ms slack buffer.
+    /// First consecutive hop past [`NPU_HOP_GATE_MS`]: absorbed by slack.
     HeldOnce,
     /// Second (or later) consecutive late hop: output was crossfaded toward
     /// latency-aligned bypass for this hop and should be logged.
     CrossfadedToBypass,
 }
 
-/// Tracks hop inference duration against the 10 ms hop budget and maintains a
+/// Tracks hop inference duration against [`NPU_HOP_GATE_MS`] and maintains a
 /// 5-hop (50 ms) delay line of raw input hops so a second consecutive late hop
 /// can smoothly crossfade to latency-aligned bypass.
 pub struct LateHopGuard {
@@ -276,6 +458,21 @@ impl LateHopGuard {
         self.total_crossfades
     }
 
+    /// Push one raw hop and return the sample-aligned hop from
+    /// [`MODEL_DELAY_HOPS`] ago. Used for bypass without running the model.
+    pub fn delay_raw(&mut self, raw_input_hop: &[f32; HOP]) -> [f32; HOP] {
+        self.raw_delay.push_back(*raw_input_hop);
+        self.raw_delay.pop_front().unwrap_or(*raw_input_hop)
+    }
+
+    /// Drop the delay line back to silence. Totals are kept for status.
+    pub fn reset(&mut self) {
+        for frame in &mut self.raw_delay {
+            *frame = [0.0; HOP];
+        }
+        self.consecutive_late = 0;
+    }
+
     /// Record a completed hop, updating `denoised_hop` in place if a second
     /// consecutive late hop requires crossfading toward latency-aligned bypass.
     pub fn observe_hop(
@@ -284,10 +481,9 @@ impl LateHopGuard {
         denoised_hop: &mut [f32; HOP],
         elapsed_ms: f64,
     ) -> LateOutcome {
-        self.raw_delay.push_back(*raw_input_hop);
-        let aligned_raw = self.raw_delay.pop_front().unwrap_or(*raw_input_hop);
+        let aligned_raw = self.delay_raw(raw_input_hop);
 
-        if elapsed_ms <= HOP_PERIOD_MS {
+        if elapsed_ms <= NPU_HOP_GATE_MS {
             self.consecutive_late = 0;
             return LateOutcome::OnTime;
         }
@@ -322,6 +518,14 @@ pub struct RuntimeSnapshot {
     pub last_hop_ms: f64,
     pub late_hops: u64,
     pub bypass_crossfades: u64,
+    /// Configured [`NpuGate`] word (`auto`, `call`, `signal`, `always`).
+    pub npu_gate: &'static str,
+    /// `true` when the latest hop was submitted to the neural net.
+    pub npu_active: bool,
+    /// Why the latest hop did or did not run: `call`, `signal`, `always`, `idle`, `bypass`, `off`, `mute`.
+    pub npu_activity: &'static str,
+    /// Process holding the virtual microphone when `npu_activity` is `call`.
+    pub npu_client: String,
 }
 
 impl Default for RuntimeSnapshot {
@@ -338,6 +542,10 @@ impl Default for RuntimeSnapshot {
             last_hop_ms: 0.0,
             late_hops: 0,
             bypass_crossfades: 0,
+            npu_gate: "auto",
+            npu_active: false,
+            npu_activity: "idle",
+            npu_client: String::new(),
         }
     }
 }
@@ -363,6 +571,10 @@ impl SharedEngineState {
             last_hop_ms: 0.0,
             late_hops: 0,
             bypass_crossfades: 0,
+            npu_gate: cfg.npu_gate.as_str(),
+            npu_active: false,
+            npu_activity: "idle",
+            npu_client: String::new(),
         };
         Arc::new(Self {
             config: Mutex::new(cfg),
@@ -476,6 +688,30 @@ pub mod win_wasapi {
         Ok((default_dev, default_name))
     }
 
+    /// Active capture endpoints. The first value is the Windows default microphone.
+    pub fn capture_device_names() -> Result<(String, Vec<String>), String> {
+        let _ = wasapi::initialize_mta();
+        let default = wasapi::get_default_device(&Direction::Capture)
+            .map_err(|e| format!("default capture device: {e}"))?;
+        let default_name = default
+            .get_friendlyname()
+            .unwrap_or_else(|_| "Default".to_string());
+        let coll = DeviceCollection::new(&Direction::Capture)
+            .map_err(|e| format!("enumerate capture devices: {e}"))?;
+        let count = coll
+            .get_nbr_devices()
+            .map_err(|e| format!("count capture devices: {e}"))?;
+        let mut names = Vec::with_capacity(count as usize);
+        for idx in 0..count {
+            if let Ok(dev) = coll.get_device_at_index(idx) {
+                if let Ok(name) = dev.get_friendlyname() {
+                    names.push(name);
+                }
+            }
+        }
+        Ok((default_name, names))
+    }
+
     /// Start the WASAPI capture thread and the 2 MiB MMCSS Pro Audio inference/render thread.
     pub fn spawn_audio_pipeline(
         state: Arc<SharedEngineState>,
@@ -510,20 +746,41 @@ pub mod win_wasapi {
         Ok((cap_handle, inf_handle))
     }
 
-    fn run_capture_loop(state: &SharedEngineState, queue: &HopQueue) -> Result<(), String> {
-        let _ = wasapi::initialize_mta();
-        let mic_query = state
+    fn configured_mic(state: &SharedEngineState) -> Option<String> {
+        state
             .config
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .mic
-            .clone();
-        let (device, dev_name) = pick_device(Direction::Capture, mic_query.as_deref())?;
+            .clone()
+    }
+
+    fn run_capture_loop(state: &SharedEngineState, queue: &HopQueue) -> Result<(), String> {
+        let _ = wasapi::initialize_mta();
+        while !state.is_stopped() {
+            let mic_query = configured_mic(state);
+            if let Err(err) = capture_one_device(state, queue, mic_query.as_deref()) {
+                eprintln!("hushmic-win: capture device: {err}");
+                std::thread::sleep(Duration::from_millis(400));
+            }
+        }
+        wasapi::deinitialize();
+        Ok(())
+    }
+
+    /// Capture from one endpoint until the configured microphone changes or the engine stops.
+    fn capture_one_device(
+        state: &SharedEngineState,
+        queue: &HopQueue,
+        mic_query: Option<&str>,
+    ) -> Result<(), String> {
+        let (device, dev_name) = pick_device(Direction::Capture, mic_query)?;
         state
             .snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .capture_device = dev_name;
+        queue.clear();
 
         let mut client = device
             .get_iaudioclient()
@@ -560,8 +817,11 @@ pub mod win_wasapi {
             .start_stream()
             .map_err(|e| format!("capture start_stream: {e}"))?;
 
-        while !state.is_stopped() {
+        while !state.is_stopped() && configured_mic(state).as_deref() == mic_query {
             let _ = event.wait_for_event(100);
+            if state.is_stopped() || configured_mic(state).as_deref() != mic_query {
+                break;
+            }
             raw_bytes.clear();
             if capture.read_from_device_to_deque(&mut raw_bytes).is_err() {
                 continue;
@@ -586,7 +846,6 @@ pub mod win_wasapi {
         }
 
         let _ = client.stop_stream();
-        wasapi::deinitialize();
         Ok(())
     }
 
@@ -642,10 +901,16 @@ pub mod win_wasapi {
 
         let mut stream = StreamDenoiser::new(denoiser);
         let mut late_guard = LateHopGuard::new();
+        let mut signal_gate = SignalGate::new();
+        let mut call_watch = CallWatch::new();
         let mut hop_in = [0.0f32; HOP];
         let mut hop_out = [0.0f32; HOP];
+        let mut last_out = [0.0f32; HOP];
         let mut interleaved = Vec::<f32>::with_capacity(HOP * render_channels);
         let mut byte_deque = VecDeque::<u8>::with_capacity(HOP * render_channels * 8);
+        let mut arm_reset = false;
+        let mut was_running = false;
+        let mut last_log: Option<(bool, &'static str)> = None;
 
         client
             .start_stream()
@@ -659,45 +924,119 @@ pub mod win_wasapi {
                 continue;
             }
 
-            // Synchronize mode and attenuation limit with shared config.
-            {
+            let (enabled, run_mode, attn_limit, gate_mode, render_device) = {
                 let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner());
-                let target_mode = if cfg.enabled {
-                    cfg.mode.to_denoiser_mode()
+                (
+                    cfg.enabled,
+                    cfg.mode,
+                    cfg.attn_limit,
+                    cfg.npu_gate,
+                    cfg.render_device.clone(),
+                )
+            };
+
+            let signal_open = matches!(gate_mode, NpuGate::Auto | NpuGate::Signal)
+                && signal_gate.observe(&hop_in);
+            let call_active = if matches!(gate_mode, NpuGate::Auto | NpuGate::Call) {
+                call_watch.poll(&render_device, gate_mode)
+            } else {
+                None
+            };
+            let decision = decide_hop(gate_mode, enabled, run_mode, call_active, signal_open);
+
+            if last_log != Some((decision.run_npu, decision.reason)) {
+                last_log = Some((decision.run_npu, decision.reason));
+                if decision.run_npu && decision.reason == "call" {
+                    match call_watch.client.as_deref() {
+                        Some(name) => eprintln!("hushmic-win: NPU running (call: {name})"),
+                        None => eprintln!("hushmic-win: NPU running (call)"),
+                    }
+                } else if decision.run_npu {
+                    eprintln!("hushmic-win: NPU running ({})", decision.reason);
+                } else if decision.reason == "idle" {
+                    let waiting = match gate_mode {
+                        NpuGate::Call => "a call",
+                        NpuGate::Signal => "microphone signal",
+                        _ => "a call or microphone signal",
+                    };
+                    eprintln!("hushmic-win: NPU idle — waiting for {waiting}");
                 } else {
-                    hushmic_denoiser::Mode::Bypass
-                };
+                    eprintln!("hushmic-win: NPU off ({})", decision.reason);
+                }
+            }
+
+            let mut elapsed_ms = 0.0;
+            if decision.run_npu {
+                let target_mode = run_mode.to_denoiser_mode();
                 if stream.denoiser().mode() != target_mode {
                     stream.denoiser_mut().set_mode(target_mode);
                 }
-                if (stream.denoiser().attenuation_limit_db() - cfg.attn_limit).abs() > 0.01 {
-                    stream
-                        .denoiser_mut()
-                        .set_attenuation_limit_db(cfg.attn_limit);
+                if (stream.denoiser().attenuation_limit_db() - attn_limit).abs() > 0.01 {
+                    stream.denoiser_mut().set_attenuation_limit_db(attn_limit);
+                }
+                if arm_reset {
+                    // Recurrent state from the previous session would color the new one.
+                    stream.reset();
+                    late_guard.reset();
+                    arm_reset = false;
+                }
+                let t0 = Instant::now();
+                let cleaned = stream.process(&hop_in);
+                elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                if cleaned.len() >= HOP {
+                    hop_out.copy_from_slice(&cleaned[..HOP]);
+                } else {
+                    hop_out = [0.0; HOP];
+                }
+                let outcome = late_guard.observe_hop(&hop_in, &mut hop_out, elapsed_ms);
+                if outcome == LateOutcome::CrossfadedToBypass {
+                    eprintln!(
+                        "hushmic-win: consecutive late hop ({elapsed_ms:.2} ms > {NPU_HOP_GATE_MS:.1} ms); crossfaded hop to bypass"
+                    );
+                }
+            } else {
+                arm_reset = true;
+                if decision.passthrough {
+                    let raw = late_guard.delay_raw(&hop_in);
+                    if was_running {
+                        let inv = 1.0 / HOP as f32;
+                        for i in 0..HOP {
+                            let alpha = i as f32 * inv;
+                            hop_out[i] = last_out[i] * (1.0 - alpha) + raw[i] * alpha;
+                        }
+                    } else {
+                        hop_out = raw;
+                    }
+                } else if was_running {
+                    fade_out(&last_out, &mut hop_out);
+                    let _ = late_guard.delay_raw(&hop_in);
+                } else {
+                    hop_out = [0.0; HOP];
+                    let _ = late_guard.delay_raw(&hop_in);
                 }
             }
-
-            let t0 = Instant::now();
-            let cleaned = stream.process(&hop_in);
-            let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
-            if cleaned.len() >= HOP {
-                hop_out.copy_from_slice(&cleaned[..HOP]);
-            } else {
-                hop_out = [0.0; HOP];
-            }
-
-            let outcome = late_guard.observe_hop(&hop_in, &mut hop_out, elapsed_ms);
-            if outcome == LateOutcome::CrossfadedToBypass {
-                eprintln!(
-                    "hushmic-win: consecutive late hop ({elapsed_ms:.2} ms > {HOP_PERIOD_MS:.1} ms); crossfaded hop to bypass"
-                );
-            }
+            was_running = decision.run_npu;
+            last_out = hop_out;
 
             {
                 let mut snap = state.snapshot.lock().unwrap_or_else(|p| p.into_inner());
                 snap.last_hop_ms = elapsed_ms;
                 snap.late_hops = late_guard.total_late();
                 snap.bypass_crossfades = late_guard.total_crossfades();
+                snap.npu_gate = gate_mode.as_str();
+                snap.npu_active = decision.run_npu;
+                snap.npu_activity = decision.reason;
+                if decision.reason == "call" {
+                    let client = call_watch.client.as_deref().unwrap_or("");
+                    if snap.npu_client != client {
+                        snap.npu_client = client.to_string();
+                    }
+                } else if !snap.npu_client.is_empty() {
+                    snap.npu_client.clear();
+                }
+                snap.enabled = enabled;
+                snap.mode = run_mode;
+                snap.attn_limit_db = attn_limit;
             }
 
             mono_to_interleaved(&hop_out, render_channels, &mut interleaved);
@@ -717,6 +1056,180 @@ pub mod win_wasapi {
         let _ = client.stop_stream();
         wasapi::deinitialize();
         Ok(())
+    }
+
+    /// Polls the virtual-microphone capture endpoint a few times a second.
+    struct CallWatch {
+        last_poll: Option<Instant>,
+        cached: Option<bool>,
+        client: Option<String>,
+        unknown_logged: bool,
+    }
+
+    impl CallWatch {
+        fn new() -> Self {
+            Self {
+                last_poll: None,
+                cached: None,
+                client: None,
+                unknown_logged: false,
+            }
+        }
+
+        /// `Some(true)` when another process is recording the paired capture endpoint.
+        /// `None` when that endpoint cannot be seen; the signal gate still applies in `auto`.
+        fn poll(&mut self, render_device: &str, gate: NpuGate) -> Option<bool> {
+            let due = match self.last_poll {
+                Some(t) => t.elapsed() >= Duration::from_millis(200),
+                None => true,
+            };
+            if !due {
+                return self.cached;
+            }
+            self.last_poll = Some(Instant::now());
+            match capture_clients(render_device) {
+                Ok(names) if names.is_empty() => {
+                    self.cached = Some(false);
+                    self.client = None;
+                    self.unknown_logged = false;
+                    Some(false)
+                }
+                Ok(names) => {
+                    self.cached = Some(true);
+                    self.client = Some(names.join(", "));
+                    self.unknown_logged = false;
+                    Some(true)
+                }
+                Err(err) => {
+                    if !self.unknown_logged {
+                        if gate == NpuGate::Call {
+                            eprintln!(
+                                "hushmic-win: call detection unavailable ({err}); NPU stays idle"
+                            );
+                        } else {
+                            eprintln!(
+                                "hushmic-win: call detection unavailable ({err}); NPU wakes on microphone signal"
+                            );
+                        }
+                        self.unknown_logged = true;
+                    }
+                    self.cached = None;
+                    self.client = None;
+                    None
+                }
+            }
+        }
+    }
+
+    /// Names of other processes with an active capture session on the endpoint
+    /// paired with `render_device` (`CABLE Input` -> `CABLE Output`).
+    fn capture_clients(render_device: &str) -> Result<Vec<String>, String> {
+        let query = super::paired_capture_query(render_device).ok_or_else(|| {
+            format!("'{render_device}' has no Input/Output pair to watch for a call")
+        })?;
+        let id = capture_device_id(&query)?;
+        active_capture_clients(&id)
+    }
+
+    fn capture_device_id(query: &str) -> Result<String, String> {
+        let coll = DeviceCollection::new(&Direction::Capture)
+            .map_err(|e| format!("enumerate capture devices: {e}"))?;
+        let count = coll
+            .get_nbr_devices()
+            .map_err(|e| format!("count capture devices: {e}"))?;
+        let mut names = Vec::with_capacity(count as usize);
+        let mut devices = Vec::with_capacity(count as usize);
+        for idx in 0..count {
+            if let Ok(dev) = coll.get_device_at_index(idx) {
+                let name = dev.get_friendlyname().unwrap_or_default();
+                names.push(name);
+                devices.push(dev);
+            }
+        }
+        let idx = super::match_device_name(&names, Some(query))
+            .ok_or_else(|| format!("no capture device matching '{query}'"))?;
+        devices[idx]
+            .get_id()
+            .map_err(|e| format!("capture device id: {e}"))
+    }
+
+    fn active_capture_clients(device_id: &str) -> Result<Vec<String>, String> {
+        use windows::core::{Interface, PCWSTR};
+        use windows::Win32::Foundation::S_OK;
+        use windows::Win32::Media::Audio::{
+            AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
+            IMMDeviceEnumerator, MMDeviceEnumerator,
+        };
+        use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_ALL};
+
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL) }
+                .map_err(|e| format!("audio enumerator: {e}"))?;
+        let wide: Vec<u16> = device_id.encode_utf16().chain(std::iter::once(0)).collect();
+        let device = unsafe { enumerator.GetDevice(PCWSTR(wide.as_ptr())) }
+            .map_err(|e| format!("open capture endpoint: {e}"))?;
+        let manager: IAudioSessionManager2 = unsafe { device.Activate(CLSCTX_ALL, None) }
+            .map_err(|e| format!("session manager: {e}"))?;
+        let sessions = unsafe { manager.GetSessionEnumerator() }
+            .map_err(|e| format!("session enumerator: {e}"))?;
+        let count = unsafe { sessions.GetCount() }.map_err(|e| format!("session count: {e}"))?;
+        let self_pid = std::process::id();
+        let mut names = Vec::new();
+        for index in 0..count {
+            let Ok(control) = (unsafe { sessions.GetSession(index) }) else {
+                continue;
+            };
+            let Ok(state) = (unsafe { control.GetState() }) else {
+                continue;
+            };
+            if state != AudioSessionStateActive {
+                continue;
+            }
+            let Ok(control2) = control.cast::<IAudioSessionControl2>() else {
+                continue;
+            };
+            if unsafe { control2.IsSystemSoundsSession() } == S_OK {
+                continue;
+            }
+            let Ok(pid) = (unsafe { control2.GetProcessId() }) else {
+                continue;
+            };
+            if pid == 0 || pid == self_pid {
+                continue;
+            }
+            let name = process_image_name(pid);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+            if names.len() == 3 {
+                break;
+            }
+        }
+        Ok(names)
+    }
+
+    fn process_image_name(pid: u32) -> String {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return format!("pid {pid}");
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok =
+                QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len);
+            let _ = CloseHandle(handle);
+            if ok == 0 || len == 0 {
+                return format!("pid {pid}");
+            }
+            let path = String::from_utf16_lossy(&buf[..len as usize]);
+            path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string()
+        }
     }
 }
 
@@ -774,6 +1287,11 @@ mod tests {
             Some(true)
         );
         assert!(hop.iter().all(|&x| x == 1.0));
+        q.clear();
+        assert_eq!(
+            q.pop_hop(&mut hop, std::time::Duration::from_millis(5)),
+            Some(false)
+        );
     }
 
     #[test]
@@ -786,19 +1304,119 @@ mod tests {
             assert_eq!(g.observe_hop(&raw, &mut den, 2.5), LateOutcome::OnTime);
         }
 
-        // 1st late hop (> 10 ms): held in slack, output untouched.
+        // 20 ms is inside the ceiling: denoised output stays.
+        let mut den_ok = [0.0f32; HOP];
+        assert_eq!(g.observe_hop(&raw, &mut den_ok, 20.0), LateOutcome::OnTime);
+
+        // 1st hop past 28 ms: held in slack, output untouched.
         let mut den1 = [0.0f32; HOP];
-        assert_eq!(g.observe_hop(&raw, &mut den1, 11.2), LateOutcome::HeldOnce);
+        assert_eq!(g.observe_hop(&raw, &mut den1, 29.0), LateOutcome::HeldOnce);
         assert!(den1.iter().all(|&x| x == 0.0));
 
         // 2nd consecutive late hop: crossfades from denoised (0.0) toward aligned raw (1.0).
         let mut den2 = [0.0f32; HOP];
         assert_eq!(
-            g.observe_hop(&raw, &mut den2, 12.0),
+            g.observe_hop(&raw, &mut den2, 30.0),
             LateOutcome::CrossfadedToBypass
         );
         assert_eq!(den2[0], 0.0);
         assert!(den2[HOP - 1] > 0.99);
         assert_eq!(g.total_crossfades(), 1);
+    }
+
+    #[test]
+    fn paired_capture_query_rewrites_virtual_cable_input() {
+        assert_eq!(
+            paired_capture_query("CABLE Input").as_deref(),
+            Some("CABLE Output")
+        );
+        assert_eq!(
+            paired_capture_query("CABLE Input (VB-Audio Virtual Cable)").as_deref(),
+            Some("CABLE Output (VB-Audio Virtual Cable)")
+        );
+        assert_eq!(
+            paired_capture_query("cable input").as_deref(),
+            Some("cable output")
+        );
+        assert_eq!(paired_capture_query("Speakers (Realtek)"), None);
+    }
+
+    #[test]
+    fn signal_gate_ignores_room_tone_and_opens_on_speech() {
+        let mut gate = SignalGate::new();
+        let room = [0.01f32; HOP];
+        for _ in 0..SIGNAL_LEARN_HOPS {
+            assert!(
+                !gate.observe(&room),
+                "calibration must not treat a steady room tone as speech"
+            );
+        }
+        for _ in 0..30 {
+            assert!(!gate.observe(&room), "steady room tone stays idle");
+        }
+
+        let mut quiet = SignalGate::new();
+        let zeros = [0.0f32; HOP];
+        for _ in 0..SIGNAL_LEARN_HOPS {
+            assert!(!quiet.observe(&zeros));
+        }
+        let speech = [0.08f32; HOP];
+        assert!(
+            quiet.observe(&speech),
+            "speech above the floor opens the gate"
+        );
+        let mut still_open = true;
+        for _ in 0..SIGNAL_HANGOVER_HOPS {
+            still_open &= quiet.observe(&zeros);
+        }
+        assert!(
+            still_open,
+            "hangover keeps the gate open across a short pause"
+        );
+        assert!(!quiet.observe(&zeros), "the gate closes after the hangover");
+    }
+
+    #[test]
+    fn signal_gate_opens_immediately_on_a_loud_hop() {
+        let mut gate = SignalGate::new();
+        assert!(gate.observe(&[0.2f32; HOP]));
+    }
+
+    #[test]
+    fn decide_hop_runs_for_call_or_signal_and_skips_when_idle() {
+        let idle = decide_hop(NpuGate::Auto, true, RunMode::Suppress, Some(false), false);
+        assert!(!idle.run_npu);
+        assert!(idle.passthrough);
+        assert_eq!(idle.reason, "idle");
+
+        let call = decide_hop(NpuGate::Auto, true, RunMode::Suppress, Some(true), false);
+        assert!(call.run_npu);
+        assert_eq!(call.reason, "call");
+
+        let signal = decide_hop(NpuGate::Auto, true, RunMode::Suppress, Some(false), true);
+        assert!(signal.run_npu);
+        assert_eq!(signal.reason, "signal");
+
+        let call_only = decide_hop(NpuGate::Call, true, RunMode::Suppress, Some(false), true);
+        assert!(!call_only.run_npu);
+
+        let signal_only = decide_hop(NpuGate::Signal, true, RunMode::Suppress, Some(true), false);
+        assert!(!signal_only.run_npu);
+
+        let always = decide_hop(NpuGate::Always, true, RunMode::Suppress, Some(false), false);
+        assert!(always.run_npu);
+        assert_eq!(always.reason, "always");
+
+        let bypass = decide_hop(NpuGate::Always, true, RunMode::Bypass, Some(true), true);
+        assert!(!bypass.run_npu);
+        assert!(bypass.passthrough);
+
+        let off = decide_hop(NpuGate::Always, false, RunMode::Suppress, Some(true), true);
+        assert!(!off.run_npu);
+        assert!(off.passthrough);
+
+        let mute = decide_hop(NpuGate::Always, true, RunMode::Mute, Some(true), true);
+        assert!(!mute.run_npu);
+        assert!(!mute.passthrough);
     }
 }

@@ -6,6 +6,8 @@ pub mod autostart;
 pub mod bench;
 pub mod config;
 pub mod control;
+#[cfg(windows)]
+pub mod mic_picker;
 pub mod tray;
 
 use std::process::ExitCode;

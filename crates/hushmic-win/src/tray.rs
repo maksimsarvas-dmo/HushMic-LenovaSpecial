@@ -1,5 +1,5 @@
 //! Windows system tray menu (`#[cfg(windows)]`) using `tray-icon`.
-//! Exposes Suppress, Bypass, Mute, Off, Autostart, and Quit.
+//! Exposes Suppress, Bypass, Mute, Off, microphone picker, Autostart, and Quit.
 
 #[cfg(windows)]
 pub mod win_tray {
@@ -56,6 +56,10 @@ pub mod win_tray {
             None,
         );
         let item_off = CheckMenuItem::new("Off", true, !snap.enabled, None);
+        let item_mic = {
+            let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner());
+            MenuItem::new(mic_menu_label(cfg.mic.as_deref()), true, None)
+        };
         let item_autostart = {
             let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner());
             CheckMenuItem::new("Start on login", true, cfg.autostart, None)
@@ -68,6 +72,8 @@ pub mod win_tray {
         let _ = menu.append(&item_bypass);
         let _ = menu.append(&item_mute);
         let _ = menu.append(&item_off);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let _ = menu.append(&item_mic);
         let _ = menu.append(&PredefinedMenuItem::separator());
         let _ = menu.append(&item_autostart);
         let _ = menu.append(&PredefinedMenuItem::separator());
@@ -89,6 +95,7 @@ pub mod win_tray {
         let id_bypass = item_bypass.id().clone();
         let id_mute = item_mute.id().clone();
         let id_off = item_off.id().clone();
+        let id_mic = item_mic.id().clone();
         let id_autostart = item_autostart.id().clone();
         let id_quit = item_quit.id().clone();
 
@@ -101,7 +108,16 @@ pub mod win_tray {
             item_autostart.set_checked(cfg.autostart);
         };
 
+        let mut tick: u32 = 0;
         while !state.is_stopped() {
+            tick = tick.wrapping_add(1);
+            if tick.is_multiple_of(40) {
+                let (active, activity, client) = {
+                    let snap = state.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+                    (snap.npu_active, snap.npu_activity, snap.npu_client.clone())
+                };
+                let _ = _tray.set_tooltip(Some(npu_tooltip(active, activity, &client)));
+            }
             pump_win32_messages();
             while let Ok(event) = MenuEvent::receiver().try_recv() {
                 if event.id == id_suppress {
@@ -112,6 +128,27 @@ pub mod win_tray {
                     let _ = handle_request(&state, Request::SetMode(Some(RunMode::Mute)));
                 } else if event.id == id_off {
                     let _ = handle_request(&state, Request::SetMode(None));
+                } else if event.id == id_mic {
+                    let current = {
+                        let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner());
+                        cfg.mic.clone()
+                    };
+                    match crate::mic_picker::choose_microphone(current.as_deref()) {
+                        Ok(Some(choice)) => {
+                            let value = choice.unwrap_or_else(|| "default".to_string());
+                            let _ = handle_request(
+                                &state,
+                                Request::ConfigSet {
+                                    key: "mic".into(),
+                                    value,
+                                },
+                            );
+                            let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner());
+                            item_mic.set_text(mic_menu_label(cfg.mic.as_deref()));
+                        }
+                        Ok(None) => {}
+                        Err(err) => crate::mic_picker::report_picker_error(&err),
+                    }
                 } else if event.id == id_autostart {
                     let next = {
                         let cfg = state.config.lock().unwrap_or_else(|p| p.into_inner());
@@ -132,6 +169,36 @@ pub mod win_tray {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         Ok(())
+    }
+
+    fn npu_tooltip(active: bool, activity: &str, client: &str) -> String {
+        if active && activity == "call" && !client.is_empty() {
+            format!("HushMic — NPU: звонок ({client})")
+        } else if active && activity == "call" {
+            "HushMic — NPU: звонок".to_string()
+        } else if active && activity == "signal" {
+            "HushMic — NPU: сигнал с микрофона".to_string()
+        } else if active {
+            "HushMic — NPU включен".to_string()
+        } else if activity == "idle" {
+            "HushMic — NPU спит".to_string()
+        } else {
+            "HushMic — NPU выключен".to_string()
+        }
+    }
+
+    fn mic_menu_label(mic: Option<&str>) -> String {
+        match mic.map(str::trim).filter(|s| !s.is_empty()) {
+            None => "Микрофон: по умолчанию".to_string(),
+            Some(name) => {
+                let short: String = name.chars().take(42).collect();
+                if name.chars().count() > 42 {
+                    format!("Микрофон: {short}…")
+                } else {
+                    format!("Микрофон: {short}")
+                }
+            }
+        }
     }
 
     fn pump_win32_messages() {

@@ -84,6 +84,10 @@ struct StatusJson<'a> {
     last_hop_ms: f64,
     late_hops: u64,
     bypass_crossfades: u64,
+    npu_gate: &'a str,
+    npu_active: bool,
+    npu_activity: &'a str,
+    npu_client: &'a str,
 }
 
 /// Execute a [`Request`] against the running engine state.
@@ -109,11 +113,23 @@ pub fn handle_request(state: &SharedEngineState, req: Request) -> Result<String,
                     last_hop_ms: snap.last_hop_ms,
                     late_hops: snap.late_hops,
                     bypass_crossfades: snap.bypass_crossfades,
+                    npu_gate: snap.npu_gate,
+                    npu_active: snap.npu_active,
+                    npu_activity: snap.npu_activity,
+                    npu_client: snap.npu_client.as_str(),
                 };
                 serde_json::to_string(&payload).map_err(|e| e.to_string())
             } else {
+                let npu_line = if snap.npu_active && !snap.npu_client.is_empty() {
+                    format!(
+                        "npu: {} ({}, gate {})",
+                        snap.npu_activity, snap.npu_client, snap.npu_gate
+                    )
+                } else {
+                    format!("npu: {} (gate {})", snap.npu_activity, snap.npu_gate)
+                };
                 let mut out = format!(
-                    "mode: {mode_str}\nengine: {}\nmodel: {}\nattn_limit: {} dB\ncapture: {}\nrender: {}\nlast_hop: {:.2} ms (late: {}, crossfades: {})",
+                    "mode: {mode_str}\nengine: {}\nmodel: {}\nattn_limit: {} dB\ncapture: {}\nrender: {}\n{npu_line}\nlast_hop: {:.2} ms (late: {}, crossfades: {})",
                     snap.engine,
                     snap.model,
                     snap.attn_limit_db,

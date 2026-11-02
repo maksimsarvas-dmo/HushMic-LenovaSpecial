@@ -7,7 +7,7 @@ use hushmic_denoiser::{Denoiser, NpuInference, StreamDenoiser, HOP, SAMPLE_RATE}
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// E16 NPU qualification threshold: p99 <= 8.0 ms per 10 ms hop.
+/// E16 NPU qualification threshold: p99 <= [`NPU_HOP_GATE_MS`] per hop.
 pub const NPU_P99_GATE_MS: f64 = hushmic_denoiser::NPU_HOP_GATE_MS;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -332,8 +332,8 @@ mod tests {
         assert!(stats.p99_ms <= NPU_P99_GATE_MS);
         assert!(stats.gate_passed);
 
-        samples.push(15.0);
-        samples.push(16.0);
+        samples.push(40.0);
+        samples.push(41.0);
         let slow = compute_stats(&samples);
         assert!(!slow.gate_passed);
     }

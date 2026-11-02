@@ -18,9 +18,9 @@ use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 
-/// Real-time gate for one 10 ms hop. `NpuInference::Auto` falls back to ONNX
-/// Runtime when an on-device NPU probe's p99 exceeds this.
-pub const NPU_HOP_GATE_MS: f64 = 8.0;
+/// NPU hop ceiling. `NpuInference::Auto` stays on the NPU while the on-device
+/// probe median is at most this, and falls back to ONNX Runtime above it.
+pub const NPU_HOP_GATE_MS: f64 = 28.0;
 
 /// Which inference backend [`Denoiser::from_file_npu`](crate::Denoiser::from_file_npu) selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

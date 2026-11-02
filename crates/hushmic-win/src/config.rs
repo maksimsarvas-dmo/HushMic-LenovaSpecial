@@ -42,6 +42,46 @@ impl RunMode {
     }
 }
 
+/// When the Intel NPU (or the ONNX fallback) is allowed to run.
+///
+/// The model is a recurrent net, so it still runs on every 10 ms hop *while
+/// a gate is open*. The gate only stops inference when nobody needs it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum NpuGate {
+    /// Run while a communication app is capturing the virtual microphone,
+    /// or while the physical microphone is above its noise floor.
+    #[default]
+    Auto,
+    /// Run only while some other process captures the virtual microphone.
+    Call,
+    /// Run only while the physical microphone is above its noise floor.
+    Signal,
+    /// Run on every hop for the whole time the engine is in Suppress.
+    Always,
+}
+
+impl NpuGate {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "call" => Some(Self::Call),
+            "signal" | "mic" => Some(Self::Signal),
+            "always" => Some(Self::Always),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Call => "call",
+            Self::Signal => "signal",
+            Self::Always => "always",
+        }
+    }
+}
+
 /// Named attenuation limit presets matching the Linux CLI (`crates/hushmic/src/config_cli.rs`).
 pub const ATTN_PRESETS: [(&str, f32); 4] = [
     ("maximum", 100.0),
@@ -98,6 +138,8 @@ pub struct Config {
     pub autostart: bool,
     /// Show the system tray icon while running.
     pub tray: bool,
+    /// When to submit hops to the NPU. See [`NpuGate`].
+    pub npu_gate: NpuGate,
 }
 
 impl Default for Config {
@@ -112,6 +154,7 @@ impl Default for Config {
             inference: "auto".to_string(),
             autostart: false,
             tray: true,
+            npu_gate: NpuGate::Auto,
         }
     }
 }
@@ -237,8 +280,9 @@ impl Config {
             "inference" | "engine" => Ok(self.inference.clone()),
             "autostart" => Ok(self.autostart.to_string()),
             "tray" => Ok(self.tray.to_string()),
+            "npu_gate" | "gate" => Ok(self.npu_gate.as_str().to_string()),
             other => Err(format!(
-                "unknown key '{other}' (keys: enabled mode mic render_device model attn_limit inference autostart tray)"
+                "unknown key '{other}' (keys: enabled mode mic render_device model attn_limit inference autostart tray npu_gate)"
             )),
         }
     }
@@ -294,9 +338,14 @@ impl Config {
             "tray" => {
                 self.tray = parse_bool(val, "tray")?;
             }
+            "npu_gate" | "gate" => {
+                self.npu_gate = NpuGate::parse(val).ok_or_else(|| {
+                    format!("invalid npu_gate '{val}' (use auto|call|signal|always)")
+                })?;
+            }
             other => {
                 return Err(format!(
-                    "unknown key '{other}' (settable keys: mode mic render_device model attn_limit inference autostart tray)"
+                    "unknown key '{other}' (settable keys: mode mic render_device model attn_limit inference autostart tray npu_gate)"
                 ));
             }
         }
@@ -352,6 +401,12 @@ mod tests {
 
         cfg.set_key("autostart", "true").unwrap();
         assert!(cfg.autostart);
+
+        assert_eq!(cfg.get_key("npu_gate").unwrap(), "auto");
+        cfg.set_key("npu_gate", "call").unwrap();
+        assert_eq!(cfg.npu_gate, NpuGate::Call);
+        cfg.set_key("gate", "signal").unwrap();
+        assert_eq!(cfg.npu_gate, NpuGate::Signal);
     }
 
     #[test]

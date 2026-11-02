@@ -12,6 +12,7 @@
 /dist
 /.venv-assets
 /.build-tools
+/packaging/windows/build-config.iss
 
 # Editor / OS cruft
 *.swp

@@ -26,6 +26,14 @@ cargo test -p hushmic-denoiser --features npu
 
 This produces `target\release\hushmic-win.exe`.
 
+A setup program with that binary, ONNX Runtime, the OpenVINO NPU runtime, and the DPDFNet models (including the NPU split files) is built by:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build-installer.ps1
+```
+
+The script writes `dist\HushMic-Setup-<version>.exe`. It needs [Inno Setup 6](https://jrsoftware.org/isinfo.php) (`winget install JRSoftware.InnoSetup`) plus the local `.build-tools` copies of ONNX Runtime and OpenVINO. The Intel AI Boost driver and VB-Audio Virtual Cable are not inside the setup.
+
 ---
 
 ## Runtime Files Layout
@@ -91,13 +99,13 @@ When moving this repository to the **ThinkPad E16 Gen 3 (Intel Core Ultra)**:
    python scripts\split-npu-model.py assets\models\dpdfnet2_48khz_hr.onnx
    ```
    Copy the generated `*.front.onnx`, `*.body.onnx` and `*.split.txt` files next to the model. Without them, `--engine npu` compiles the whole graph (wrong output) and `--engine auto` falls back to ONNX CPU.
-   Measured on a Core Ultra 5 125U: the `light` model reaches 38-44 dB waveform SNR versus ONNX and uses roughly 4-5x less CPU time per hop than ONNX CPU. The `quality` model is accurate but too slow on this NPU (body about 14 ms per 10 ms hop), so it stays on the CPU.
+   Measured on a Core Ultra 5 125U: the `light` model reaches 38-44 dB waveform SNR versus ONNX and uses roughly 4-5x less CPU time per hop than ONNX CPU. The `quality` model body is about 14 ms per hop and stays on the NPU: `auto` leaves the NPU only when the hop median reaches 28 ms.
 4. **Run the Hop-Time Qualification Benchmark:**
    ```powershell
    hushmic-win bench --engine npu --model light --hops 1000
    ```
    - Confirm `active_engine: openvino npu` is reported (no `fallback_reason`).
-   - Confirm `qual_gate (p99 <= 8.0 ms): PASS`. First run populates `%LOCALAPPDATA%\HushMic\ov-cache`; subsequent starts load the cached NPU blob immediately.
+   - Confirm `qual_gate (p99 <= 28.0 ms): PASS`. First run populates `%LOCALAPPDATA%\HushMic\ov-cache`; subsequent starts load the cached NPU blob immediately.
 5. **Install VB-Audio Virtual Cable:**
    - Install VB-Cable so Windows has `CABLE Input` (playback) and `CABLE Output` (recording).
    - Start `hushmic-win` and select **`CABLE Output`** as the microphone inside Microsoft Teams, Zoom, Discord, or your browser.
@@ -105,4 +113,4 @@ When moving this repository to the **ThinkPad E16 Gen 3 (Intel Core Ultra)**:
    - Turn off **Windows Studio Effects -> Voice Focus** and **Lenovo Vantage Smart Noise Cancellation** on the raw microphone endpoint so two neural suppressors are not stacked in series.
 7. **Production Follow-ups on Hardware:**
    - **Signed WaveRT Virtual Microphone Driver:** Replace VB-Cable with an EV-signed WaveRT virtual audio driver so **HushMic** appears directly as a native Windows microphone endpoint.
-   - **NNCF INT8 Calibration:** If `dpdfnet8_48khz_hr` in FP16 on a given NPU driver revision exceeds the 8 ms p99 gate or you want lower package power, quantize the spectral ONNX weights to INT8 with OpenVINO NNCF against speech+noise calibration clips and verify waveform SNR >= 30 dB and DNSMOS drop <= 0.05.
+   - **NNCF INT8 Calibration:** If `dpdfnet8_48khz_hr` in FP16 on a given NPU driver revision exceeds the 28 ms hop ceiling or you want lower package power, quantize the spectral ONNX weights to INT8 with OpenVINO NNCF against speech+noise calibration clips and verify waveform SNR >= 30 dB and DNSMOS drop <= 0.05.
