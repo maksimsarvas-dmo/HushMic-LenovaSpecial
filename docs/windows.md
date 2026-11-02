@@ -1,6 +1,8 @@
-# HushMic on Windows & Lenovo ThinkPad E16 (Intel NPU)
+# HushMic NPU Fork — Windows & Lenovo ThinkPad E16 (Intel NPU)
 
-`hushmic-win` brings HushMic's DPDFNet 48 kHz real-time noise suppression to Windows 11, targeting the **Lenovo ThinkPad E16 Gen 3 (Intel Core Ultra 200H)** and **Gen 2 (Meteor Lake)** NPU via OpenVINO with automatic fallback to ONNX Runtime on the CPU.
+This document belongs to the **HushMic NPU Fork** of [Fovty/hushmic](https://github.com/Fovty/hushmic). Upstream HushMic is the Linux, CPU-only app. The Windows engine, the OpenVINO NPU backend, the model split, and the call/signal idle gate are fork-only.
+
+`hushmic-win` brings the fork's DPDFNet 48 kHz real-time noise suppression to Windows 11, targeting the **Lenovo ThinkPad E16 Gen 3 (Intel Core Ultra 200H)** and **Gen 2 (Meteor Lake)** NPU via OpenVINO with automatic fallback to ONNX Runtime on the CPU.
 
 ## Architecture Overview
 
@@ -70,9 +72,22 @@ hushmic-win config set attn_limit strong
 hushmic-win config set inference npu
 hushmic-win config set mic "Realtek"
 hushmic-win config set render_device "CABLE Input"
+hushmic-win config set npu_gate auto # auto | call | signal | always
 hushmic-win config set autostart true
 hushmic-win quit                    # Stop the running daemon
 ```
+
+`status` includes an `npu:` line. `npu: idle (gate auto)` means inference is not being submitted. `npu: call (Teams.exe, gate auto)` means a capture session on the virtual microphone is keeping the NPU busy. `npu: signal (gate auto)` means the physical microphone rose above its noise floor.
+
+### When the NPU runs
+
+Default `npu_gate` is `auto`. The compiled model stays loaded, but a hop is submitted only when another process is actively capturing the recording endpoint paired with the render device (`CABLE Input` is watched as `CABLE Output`), or when the physical microphone is above the room-noise floor. A steady fan does not open that floor after a 500 ms calibration. A loud hop (about −30 dBFS) opens it at once, and inference then holds for 800 ms after the level drops.
+
+While the gate is closed, the neural net is not called and the virtual cable still receives latency-aligned raw microphone audio. Bypass and Off do the same. Mute writes silence. None of those paths submit hops.
+
+During an active call session every hop is submitted, so the recurrent state keeps tracking the noise. `npu_gate = signal` also sleeps through quiet gaps inside a call. The next phrase starts from a reset state, so its first syllables are weaker. `npu_gate = call` ignores the microphone level. `npu_gate = always` is the previous behavior: every hop while the mode is Suppress.
+
+The tray tooltip shows the same state. A browser tab or Discord voice channel that keeps `CABLE Output` open counts as a call until that session goes inactive.
 
 ### Offline WAV Denoising (No Virtual Cable Needed)
 

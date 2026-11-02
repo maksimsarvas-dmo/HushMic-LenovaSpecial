@@ -1,6 +1,6 @@
-# Lenovo ThinkPad E16 (Intel NPU) — Project Context & Handoff Guide
+# HushMic NPU Fork — Lenovo ThinkPad E16 (Intel NPU)
 
-This document summarizes everything implemented so far and lists the exact steps required after moving this repository and IDE to the **Lenovo ThinkPad E16 Gen 3 (Intel)** laptop.
+This handoff belongs to the **HushMic NPU Fork** of upstream [Fovty/hushmic](https://github.com/Fovty/hushmic). It summarizes everything implemented in the fork and lists the exact steps required after moving this repository and IDE to the **Lenovo ThinkPad E16 Gen 3 (Intel)** laptop.
 
 ---
 
